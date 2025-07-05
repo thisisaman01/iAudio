@@ -11,6 +11,17 @@
 			<key>UIWindowSceneSessionRoleApplication</key>
 			<array>
 				<dict>
+					<key>BGTaskSchedulerPermittedIdentifiers</key>
+					<array>
+						<string>com.yourcompany.iAudio.transcription</string>
+					</array>
+					<key>NSMicrophoneUsageDescription</key>
+					<string>This app needs microphone access to record audio for transcription.</string>
+					<key>UIBackgroundModes</key>
+					<array>
+						<string>audio</string>
+						<string>background-processing</string>
+					</array>
 					<key>UISceneConfigurationName</key>
 					<string>Default Configuration</string>
 					<key>UISceneDelegateClassName</key>
@@ -21,5 +32,13 @@
 			</array>
 		</dict>
 	</dict>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>processing</string>
+		<string>fetch</string>
+		<string>remote-notification</string>
+		<string>voip</string>
+	</array>
 </dict>
 </plist>

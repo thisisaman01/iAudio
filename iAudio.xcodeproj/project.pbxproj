@@ -148,6 +148,7 @@
 				DEVELOPMENT_TEAM = T9F7QDSC2S;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = iAudio/Info.plist;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "eeeee\\";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = ferfrfrfr;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
@@ -177,6 +178,7 @@
 				DEVELOPMENT_TEAM = T9F7QDSC2S;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = iAudio/Info.plist;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "eeeee\\";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = ferfrfrfr;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;

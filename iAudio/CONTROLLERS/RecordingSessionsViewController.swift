@@ -5,483 +5,37 @@
 //  Created by AMAN K.A on 04/07/25.
 //
 
-
 import Foundation
 import UIKit
 import SwiftData
 import AVFoundation
 import Combine
 
-class RecordingSessionsViewController: UIViewController {
+// MARK: - Thread-Safe Data Manager Actor
+@MainActor
+final class SessionDataManager: ObservableObject {
+    @Published var sessions: [RecordingSession] = []
+    @Published var isLoading = false
     
-    // MARK: - Properties
-    private let audioManager = AudioRecordingManager()
-    private let transcriptionService = TranscriptionService.shared
-    private var sessions: [RecordingSession] = []
-    private var filteredSessions: [RecordingSession] = []
+    private var modelContext: ModelContext?
+    private var refreshWorkItem: DispatchWorkItem?
     
-    // UI Components
-    private let tableView = UITableView()
-    private let recordButton = UIButton(type: .custom)
-    private let searchController = UISearchController(searchResultsController: nil)
-    private let recordingStatusView = UIView()
-    private let recordingLabel = UILabel()
-    private let durationLabel = UILabel()
-    private let audioLevelView = UIProgressView()
-    private let emptyStateView = UIView()
-    private let emptyStateLabel = UILabel()
-    private let transcriptionStatusView = UIView()
-    private let transcriptionLabel = UILabel()
-    
-    // Combine support - managed locally
-    private var cancellables = Set<AnyCancellable>()
-    
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        print("📱 RecordingSessionsViewController viewDidLoad")
-        setupModelContexts()
-        setupUI()
-        setupConstraints()
-        setupBindings()
-        setupEmptyState()
-        setupNotificationListeners() // ⚡ NEW
-        loadSessions()
-        startAutoRefreshTimer()
-    }
-
-    
-    
-    override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        print("🔄 View will appear - refreshing sessions")
-        loadSessions()
-        
-        // ⚡ ADDED: Force refresh after a short delay to catch any pending updates
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.loadSessions()
-        }
+    func configure(with context: ModelContext) {
+        self.modelContext = context
     }
     
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
+    func loadSessions() async {
+        guard !isLoading else { return }
         
-        // ⚡ ADDED: Additional refresh after view appears
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            self.loadSessions()
-        }
-    }
-  
-    
-    // ⚡ DEBUGGING: Add method to check current transcription status
-    private func debugTranscriptionStatus() {
-        print("🔍 DEBUG: Current sessions status:")
-        for (index, session) in sessions.enumerated() {
-            print("  Session \(index): \(session.title)")
-            print("    Total segments: \(session.totalSegments)")
-            print("    Transcribed: \(session.transcribedSegments)")
-            print("    Progress: \(Int(session.transcriptionProgress * 100))%")
-            print("    Completed: \(session.isCompleted)")
-            
-            for segment in session.segments {
-                let hasTranscription = segment.transcription != nil
-                print("    Segment \(segment.segmentIndex): \(segment.transcriptionStatus) (has transcription: \(hasTranscription))")
-            }
-        }
-    }
-
-    // ⚡ ADDED: Public method to trigger immediate refresh (for testing)
-    @objc public func triggerImmediateRefresh() {
-        print("🚀 Triggered immediate refresh")
-        debugTranscriptionStatus()
-        loadSessions()
-    }
-    
-    // ⚡ NEW: Notification listeners for instant updates
-    private func setupNotificationListeners() {
-        // Listen for transcription completion
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(transcriptionCompleted),
-            name: Notification.Name("TranscriptionCompleted"),
-            object: nil
-        )
+        isLoading = true
+        defer { isLoading = false }
         
-        // Listen for app becoming active
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(appBecameActive),
-            name: UIApplication.didBecomeActiveNotification,
-            object: nil
-        )
-    }
-
-    // ⚡ NEW: Instant UI update when transcription completes
-    @objc private func transcriptionCompleted(notification: Notification) {
-        print("🎯 Received transcription completion notification")
-        
-        if let userInfo = notification.userInfo,
-           let segmentId = userInfo["segmentId"] as? UUID,
-           let sessionId = userInfo["sessionId"] as? UUID {
-            print("📊 Transcription completed for segment \(segmentId) in session \(sessionId)")
-        }
-        
-        // ⚡ IMMEDIATE: Force UI refresh
-        DispatchQueue.main.async {
-            print("🚀 Forcing immediate UI refresh for transcription completion")
-            self.loadSessions()
-        }
-        
-        // ⚡ FOLLOW-UP: Additional refresh to ensure persistence
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.loadSessions()
-        }
-    }
-
-    // ⚡ NEW: Refresh when app becomes active
-    @objc private func appBecameActive() {
-        print("📱 App became active - refreshing UI")
-        loadSessions()
-    }
-    private func setupModelContexts() {
-        // Pass ModelContext to AudioRecordingManager
-        audioManager.modelContext = modelContext
-        
-        // Pass ModelContext to TranscriptionService
-        transcriptionService.modelContext = modelContext
-        
-        print("✅ ModelContext set on managers")
-    }
-    
-    // ⚡ CLEANUP: Remove notification observers
-    deinit {
-        print("🗑️ RecordingSessionsViewController deinit")
-        NotificationCenter.default.removeObserver(self)
-        cancellables.removeAll()
-    }
-    
-    // MARK: - UI Setup
-    private func setupUI() {
-        title = "Audio Recordings"
-        view.backgroundColor = .systemBackground
-        
-        // Navigation bar setup
-        navigationItem.rightBarButtonItem = UIBarButtonItem(
-            title: "Settings",
-            style: .plain,
-            target: self,
-            action: #selector(settingsButtonTapped)
-        )
-        
-        navigationItem.leftBarButtonItem = UIBarButtonItem(
-            title: "Export",
-            style: .plain,
-            target: self,
-            action: #selector(exportButtonTapped)
-        )
-        
-        // Search controller
-        searchController.searchResultsUpdater = self
-        searchController.obscuresBackgroundDuringPresentation = false
-        searchController.searchBar.placeholder = "Search recordings and transcriptions..."
-        searchController.searchBar.searchBarStyle = .minimal
-        navigationItem.searchController = searchController
-        definesPresentationContext = true
-        
-        // Table view
-        tableView.delegate = self
-        tableView.dataSource = self
-        tableView.register(RecordingSessionTableViewCell.self, forCellReuseIdentifier: "SessionCell")
-        tableView.refreshControl = UIRefreshControl()
-        tableView.refreshControl?.addTarget(self, action: #selector(refreshSessions), for: .valueChanged)
-        tableView.separatorStyle = .singleLine
-        tableView.rowHeight = UITableView.automaticDimension
-        tableView.estimatedRowHeight = 100
-        tableView.backgroundColor = .systemGroupedBackground
-        
-        // Record button
-        recordButton.backgroundColor = .systemRed
-        recordButton.layer.cornerRadius = 35
-        recordButton.setTitle("●", for: .normal)
-        recordButton.setTitle("■", for: .selected)
-        recordButton.titleLabel?.font = .systemFont(ofSize: 24, weight: .bold)
-        recordButton.addTarget(self, action: #selector(recordButtonTapped), for: .touchUpInside)
-        recordButton.layer.shadowColor = UIColor.black.cgColor
-        recordButton.layer.shadowOffset = CGSize(width: 0, height: 2)
-        recordButton.layer.shadowRadius = 4
-        recordButton.layer.shadowOpacity = 0.3
-        
-        // Recording status view
-        recordingStatusView.backgroundColor = .systemBackground
-        recordingStatusView.layer.borderWidth = 1
-        recordingStatusView.layer.borderColor = UIColor.systemGray4.cgColor
-        recordingStatusView.layer.cornerRadius = 8
-        recordingStatusView.isHidden = true
-        
-        recordingLabel.text = "Recording..."
-        recordingLabel.font = .systemFont(ofSize: 16, weight: .medium)
-        recordingLabel.textColor = .systemRed
-        
-        durationLabel.text = "00:00"
-        durationLabel.font = .monospacedDigitSystemFont(ofSize: 16, weight: .medium)
-        durationLabel.textColor = .label
-        
-        audioLevelView.progressTintColor = .systemGreen
-        audioLevelView.trackTintColor = .systemGray5
-        audioLevelView.layer.cornerRadius = 2
-        
-        // Transcription status view
-        transcriptionStatusView.backgroundColor = .systemBlue.withAlphaComponent(0.1)
-        transcriptionStatusView.layer.borderWidth = 1
-        transcriptionStatusView.layer.borderColor = UIColor.systemBlue.cgColor
-        transcriptionStatusView.layer.cornerRadius = 8
-        transcriptionStatusView.isHidden = true
-        
-        transcriptionLabel.text = "Processing transcriptions..."
-        transcriptionLabel.font = .systemFont(ofSize: 14, weight: .medium)
-        transcriptionLabel.textColor = .systemBlue
-        transcriptionLabel.textAlignment = .center
-        
-        // Add subviews
-        [tableView, recordButton, recordingStatusView, emptyStateView, transcriptionStatusView].forEach {
-            view.addSubview($0)
-            $0.translatesAutoresizingMaskIntoConstraints = false
-        }
-        
-        [recordingLabel, durationLabel, audioLevelView].forEach {
-            recordingStatusView.addSubview($0)
-            $0.translatesAutoresizingMaskIntoConstraints = false
-        }
-        
-        transcriptionStatusView.addSubview(transcriptionLabel)
-        transcriptionLabel.translatesAutoresizingMaskIntoConstraints = false
-    }
-    
-    private func setupEmptyState() {
-        emptyStateLabel.text = "No recordings yet\n\nTap the red button to start recording.\nYour recordings will be automatically transcribed and saved here."
-        emptyStateLabel.textAlignment = .center
-        emptyStateLabel.numberOfLines = 0
-        emptyStateLabel.font = .systemFont(ofSize: 18, weight: .medium)
-        emptyStateLabel.textColor = .secondaryLabel
-        
-        let microphoneImageView = UIImageView(image: UIImage(systemName: "mic.circle"))
-        microphoneImageView.contentMode = .scaleAspectFit
-        microphoneImageView.tintColor = .systemGray3
-        microphoneImageView.translatesAutoresizingMaskIntoConstraints = false
-        
-        emptyStateView.addSubview(microphoneImageView)
-        emptyStateView.addSubview(emptyStateLabel)
-        emptyStateLabel.translatesAutoresizingMaskIntoConstraints = false
-        
-        NSLayoutConstraint.activate([
-            microphoneImageView.centerXAnchor.constraint(equalTo: emptyStateView.centerXAnchor),
-            microphoneImageView.centerYAnchor.constraint(equalTo: emptyStateView.centerYAnchor, constant: -40),
-            microphoneImageView.widthAnchor.constraint(equalToConstant: 80),
-            microphoneImageView.heightAnchor.constraint(equalToConstant: 80),
-            
-            emptyStateLabel.centerXAnchor.constraint(equalTo: emptyStateView.centerXAnchor),
-            emptyStateLabel.topAnchor.constraint(equalTo: microphoneImageView.bottomAnchor, constant: 20),
-            emptyStateLabel.leadingAnchor.constraint(greaterThanOrEqualTo: emptyStateView.leadingAnchor, constant: 20),
-            emptyStateLabel.trailingAnchor.constraint(lessThanOrEqualTo: emptyStateView.trailingAnchor, constant: -20)
-        ])
-        
-        emptyStateView.isHidden = true
-    }
-    
-    private func setupConstraints() {
-        NSLayoutConstraint.activate([
-            // Recording status view
-            recordingStatusView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-            recordingStatusView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            recordingStatusView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-            recordingStatusView.heightAnchor.constraint(equalToConstant: 80),
-            
-            recordingLabel.topAnchor.constraint(equalTo: recordingStatusView.topAnchor, constant: 16),
-            recordingLabel.leadingAnchor.constraint(equalTo: recordingStatusView.leadingAnchor, constant: 16),
-            
-            durationLabel.topAnchor.constraint(equalTo: recordingLabel.topAnchor),
-            durationLabel.trailingAnchor.constraint(equalTo: recordingStatusView.trailingAnchor, constant: -16),
-            
-            audioLevelView.topAnchor.constraint(equalTo: recordingLabel.bottomAnchor, constant: 12),
-            audioLevelView.leadingAnchor.constraint(equalTo: recordingStatusView.leadingAnchor, constant: 16),
-            audioLevelView.trailingAnchor.constraint(equalTo: recordingStatusView.trailingAnchor, constant: -16),
-            audioLevelView.heightAnchor.constraint(equalToConstant: 4),
-            
-            // Transcription status view
-            transcriptionStatusView.topAnchor.constraint(equalTo: recordingStatusView.bottomAnchor, constant: 8),
-            transcriptionStatusView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            transcriptionStatusView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-            transcriptionStatusView.heightAnchor.constraint(equalToConstant: 40),
-            
-            transcriptionLabel.centerXAnchor.constraint(equalTo: transcriptionStatusView.centerXAnchor),
-            transcriptionLabel.centerYAnchor.constraint(equalTo: transcriptionStatusView.centerYAnchor),
-            
-            // Table view
-            tableView.topAnchor.constraint(equalTo: transcriptionStatusView.bottomAnchor, constant: 8),
-            tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            tableView.bottomAnchor.constraint(equalTo: recordButton.topAnchor, constant: -16),
-            
-            // Empty state view
-            emptyStateView.topAnchor.constraint(equalTo: transcriptionStatusView.bottomAnchor, constant: 8),
-            emptyStateView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            emptyStateView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            emptyStateView.bottomAnchor.constraint(equalTo: recordButton.topAnchor, constant: -16),
-            
-            // Record button
-            recordButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            recordButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
-            recordButton.widthAnchor.constraint(equalToConstant: 70),
-            recordButton.heightAnchor.constraint(equalToConstant: 70)
-        ])
-    }
-    
-    // ⚡ OPTIMIZED: Real-time transcription status updates
-    private func setupBindings() {
-        // Audio manager bindings
-        audioManager.$isRecording
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] (isRecording: Bool) in
-                self?.recordingStatusView.isHidden = !isRecording
-                self?.recordButton.isSelected = isRecording
-                self?.recordButton.backgroundColor = isRecording ? .systemGray : .systemRed
-                
-                if !isRecording {
-                    print("🚀 Recording stopped - immediate UI refresh")
-                    self?.loadSessions()
-                    
-                    // ⚡ ADDED: Multiple refresh waves to catch transcription updates
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                        self?.loadSessions()
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                        self?.loadSessions()
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
-                        self?.loadSessions()
-                    }
-                }
-            }
-            .store(in: &cancellables)
-        
-        audioManager.$recordingDuration
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] (duration: TimeInterval) in
-                self?.durationLabel.text = self?.formatDuration(duration)
-            }
-            .store(in: &cancellables)
-        
-        audioManager.$audioLevel
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] (level: Float) in
-                self?.audioLevelView.progress = level
-            }
-            .store(in: &cancellables)
-        
-        audioManager.$errorMessage
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] (errorMessage: String?) in
-                if let error = errorMessage {
-                    self?.showErrorAlert(message: error)
-                }
-            }
-            .store(in: &cancellables)
-        
-        // ⚡ FIXED: More aggressive transcription service bindings
-        transcriptionService.$isProcessing
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] (isProcessing: Bool) in
-                let shouldShow = isProcessing
-                self?.transcriptionStatusView.isHidden = !shouldShow
-                
-                if shouldShow {
-                    self?.transcriptionLabel.text = "⚡ Transcribing now..."
-                }
-                
-                // ⚡ ADDED: Force refresh when transcription starts/stops
-                self?.loadSessions()
-            }
-            .store(in: &cancellables)
-        
-        transcriptionService.$pendingTranscriptions
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] (pendingCount: Int) in
-                if pendingCount > 0 {
-                    self?.transcriptionStatusView.isHidden = false
-                    self?.transcriptionLabel.text = "⏳ \(pendingCount) transcriptions pending"
-                }
-                
-                // ⚡ FORCE: Always refresh UI when pending count changes
-                self?.loadSessions()
-            }
-            .store(in: &cancellables)
-        
-        transcriptionService.$completedTranscriptions
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] (completedCount: Int) in
-                print("🎯 Transcription completed count: \(completedCount)")
-                
-                // ⚡ IMMEDIATE: Force UI refresh when transcription completes
-                self?.loadSessions()
-                
-                // ⚡ FOLLOW-UP: Additional refresh to ensure UI is updated
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    self?.loadSessions()
-                }
-            }
-            .store(in: &cancellables)
-    }
-
-    // ⚡ ADDED: Force refresh method for manual triggering
-    @objc private func forceRefreshUI() {
-        print("🔄 Force refreshing UI...")
-        loadSessions()
-    }
-
-    // ⚡ ADDED: Auto-refresh timer for transcription updates
-    private func startAutoRefreshTimer() {
-        var refreshInterval: TimeInterval = 1.0 // Start with 1 second
-        
-        func scheduleNextRefresh() {
-            DispatchQueue.main.asyncAfter(deadline: .now() + refreshInterval) { [weak self] in
-                guard let self = self else { return }
-                
-                let hasProcessingSessions = self.sessions.contains { session in
-                    session.totalSegments > 0 && session.transcribedSegments < session.totalSegments
-                }
-                
-                if hasProcessingSessions {
-                    print("🔄 Auto-refresh (interval: \(refreshInterval)s)")
-                    self.loadSessions()
-                    
-                    // ⚡ EXPONENTIAL BACKOFF: Increase interval but cap at 5 seconds
-                    refreshInterval = min(5.0, refreshInterval * 1.2)
-                    scheduleNextRefresh()
-                } else {
-                    print("⏹️ All transcriptions complete - stopping auto-refresh")
-                    refreshInterval = 1.0 // Reset for next time
-                }
-            }
-        }
-        
-        scheduleNextRefresh()
-    }
-
-    
-    // MARK: - Data Management
- 
-    // ⚡ OPTIMIZED: Faster session loading with smart caching
-    private func loadSessions() {
-        print("🔄⚡ Fast loading sessions...")
+        refreshWorkItem?.cancel()
         
         guard let context = modelContext else {
             print("❌ No ModelContext available")
-            updateEmptyState()
-            tableView.refreshControl?.endRefreshing()
-            showErrorAlert(message: "Database not available. Please restart the app.")
             return
         }
-        
-        print("✅⚡ ModelContext available, fast fetching data...")
         
         do {
             let descriptor = FetchDescriptor<RecordingSession>(
@@ -489,40 +43,21 @@ class RecordingSessionsViewController: UIViewController {
             )
             
             let fetchedSessions = try context.fetch(descriptor)
-            print("✅⚡ Fast fetched \(fetchedSessions.count) sessions")
+            print("🔄⚡ Fast fetched \(fetchedSessions.count) sessions")
             
-            // ⚡ FIXED: Better change detection that includes transcription updates
             let hasChanges = hasSessionChanges(oldSessions: sessions, newSessions: fetchedSessions)
             
-            self.sessions = fetchedSessions
-            self.filteredSessions = fetchedSessions
+            sessions = fetchedSessions
             
-            // ⚡ ALWAYS UPDATE UI: Force refresh to ensure transcription updates show
-            DispatchQueue.main.async {
-                self.tableView.reloadData()
-                self.updateEmptyState()
-                if hasChanges {
-                    print("✅⚡ Fast UI updated with transcription changes")
-                } else {
-                    print("✅⚡ Fast UI refreshed")
-                }
-            }
-            
-            DispatchQueue.main.async {
-                self.tableView.refreshControl?.endRefreshing()
+            if hasChanges {
+                print("✅⚡ Detected transcription changes - force UI update")
             }
             
         } catch {
             print("❌ Failed to fetch sessions: \(error)")
-            DispatchQueue.main.async {
-                self.tableView.refreshControl?.endRefreshing()
-                self.updateEmptyState()
-                self.showErrorAlert(message: "Failed to load recordings: \(error.localizedDescription)")
-            }
         }
     }
-
-    // ⚡ NEW: Better change detection for transcription updates
+    
     private func hasSessionChanges(oldSessions: [RecordingSession], newSessions: [RecordingSession]) -> Bool {
         // Check if count changed
         if oldSessions.count != newSessions.count {
@@ -552,41 +87,618 @@ class RecordingSessionsViewController: UIViewController {
         return false
     }
     
-    private func updateEmptyState() {
-        let isEmpty = filteredSessions.isEmpty
-        emptyStateView.isHidden = !isEmpty
-        tableView.isHidden = isEmpty
+    func deleteSession(_ session: RecordingSession) async throws {
+        guard let context = modelContext else {
+            throw SessionError.noContext
+        }
         
-        if isEmpty {
-            print("📭 Showing empty state")
-        } else {
-            print("📋 Showing \(filteredSessions.count) sessions")
+        let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try? FileManager.default.removeItem(at: documentsDirectory.appendingPathComponent(session.audioFilePath))
+            }
+            
+            for segment in session.segments {
+                group.addTask {
+                    try? FileManager.default.removeItem(at: documentsDirectory.appendingPathComponent(segment.audioFilePath))
+                }
+            }
+        }
+        
+        context.delete(session)
+        try context.save()
+        sessions.removeAll { $0.id == session.id }
+    }
+    
+
+    
+    deinit {
+        refreshWorkItem?.cancel()
+    }
+}
+
+enum SessionError: Error {
+    case noContext
+    case deletionFailed
+}
+
+// MARK: - Main View Controller
+final class RecordingSessionsViewController: UIViewController {
+    
+    // MARK: - Properties
+    private let audioManager = AudioRecordingManager()
+    private let transcriptionService = TranscriptionService.shared
+    private let dataManager = SessionDataManager()
+    
+    private var filteredSessions: [RecordingSession] = []
+    private var refreshWorkItem: DispatchWorkItem?
+    private var autoRefreshTask: Task<Void, Never>?
+    
+    // UI Components
+    private lazy var tableView: UITableView = {
+        let table = UITableView(frame: .zero, style: .insetGrouped)
+        table.delegate = self
+        table.dataSource = self
+        table.backgroundColor = .systemGroupedBackground
+        table.separatorStyle = .singleLine
+        table.separatorInset = UIEdgeInsets(top: 0, left: 16, bottom: 0, right: 16)
+        table.rowHeight = UITableView.automaticDimension
+        table.estimatedRowHeight = 120
+        table.sectionHeaderTopPadding = 0
+        table.contentInsetAdjustmentBehavior = .automatic
+        table.keyboardDismissMode = .onDrag
+        table.isPrefetchingEnabled = true
+        table.remembersLastFocusedIndexPath = true
+        
+        table.sectionHeaderHeight = 0
+        table.sectionFooterHeight = 0
+        table.tableHeaderView = UIView(frame: CGRect(x: 0, y: 0, width: 0, height: CGFloat.leastNonzeroMagnitude))
+        table.tableFooterView = UIView(frame: CGRect(x: 0, y: 0, width: 0, height: CGFloat.leastNonzeroMagnitude))
+        
+        let refreshControl = UIRefreshControl()
+        refreshControl.addTarget(self, action: #selector(handleRefresh), for: .valueChanged)
+        table.refreshControl = refreshControl
+        
+        table.register(AppleStyleSessionCell.self, forCellReuseIdentifier: "SessionCell")
+        return table
+    }()
+    
+    private lazy var recordButton: UIButton = {
+        let button = UIButton(type: .custom)
+        button.backgroundColor = .systemRed
+        button.layer.cornerRadius = 35
+        button.setTitle("●", for: .normal)
+        button.setTitle("■", for: .selected)
+        button.titleLabel?.font = .systemFont(ofSize: 28, weight: .medium)
+        button.addTarget(self, action: #selector(recordButtonTapped), for: .touchUpInside)
+        
+        // Apple-style shadow
+        button.layer.shadowColor = UIColor.black.cgColor
+        button.layer.shadowOffset = CGSize(width: 0, height: 2)
+        button.layer.shadowRadius = 4
+        button.layer.shadowOpacity = 0.2
+        button.layer.masksToBounds = false
+        
+        return button
+    }()
+    
+    private lazy var searchController: UISearchController = {
+        let controller = UISearchController(searchResultsController: nil)
+        controller.searchResultsUpdater = self
+        controller.obscuresBackgroundDuringPresentation = false
+        controller.searchBar.placeholder = "Search recordings and transcriptions..."
+        controller.searchBar.searchBarStyle = .minimal
+        return controller
+    }()
+    
+    // Status views - only show when needed
+    private lazy var recordingStatusView: RecordingStatusView = {
+        let view = RecordingStatusView()
+        view.isHidden = true
+        return view
+    }()
+    
+    private lazy var transcriptionStatusView: TranscriptionStatusView = {
+        let view = TranscriptionStatusView()
+        view.isHidden = true
+        return view
+    }()
+    
+    private lazy var emptyStateView: AppleStyleEmptyStateView = {
+        let view = AppleStyleEmptyStateView()
+        view.isHidden = true
+        return view
+    }()
+    
+    private var cancellables = Set<AnyCancellable>()
+    
+    // MARK: - Lifecycle
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setupUI()
+        setupConstraints()
+        setupBindings()
+        setupModelContexts()
+        setupNotificationListeners()
+        
+        Task {
+            await dataManager.loadSessions()
+        }
+        
+        startIntelligentRefresh()
+    }
+    
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        
+        Task {
+            await dataManager.loadSessions()
         }
     }
     
-    @objc private func refreshSessions() {
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        cancelRefreshOperations()
+    }
+    
+    deinit {
+        cancelRefreshOperations()
+        NotificationCenter.default.removeObserver(self)
+        cancellables.removeAll()
+    }
+    
+    // MARK: - Setup Methods
+    private func setupUI() {
+        title = "Recordings"
+        view.backgroundColor = .systemGroupedBackground
+        
+        // Apple-style navigation setup
+        navigationController?.navigationBar.prefersLargeTitles = true
+        navigationItem.largeTitleDisplayMode = .always
+        
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            image: UIImage(systemName: "gearshape"),
+            style: .plain,
+            target: self,
+            action: #selector(settingsButtonTapped)
+        )
+        
+        navigationItem.leftBarButtonItem = UIBarButtonItem(
+            image: UIImage(systemName: "square.and.arrow.up"),
+            style: .plain,
+            target: self,
+            action: #selector(exportButtonTapped)
+        )
+        
+        navigationItem.searchController = searchController
+        navigationItem.hidesSearchBarWhenScrolling = false
+        definesPresentationContext = true
+        
+        // Add main views
+        [tableView, emptyStateView, recordingStatusView, transcriptionStatusView, recordButton].forEach {
+            view.addSubview($0)
+            $0.translatesAutoresizingMaskIntoConstraints = false
+        }
+    }
+    
+    private func setupConstraints() {
+        // Create dynamic top constraint for table view
+        let tableTopConstraint = tableView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor)
+        tableTopConstraint.priority = UILayoutPriority(999)
+        
+        // Status views constraints - positioned at top when visible
+        let recordingTopConstraint = recordingStatusView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8)
+        let transcriptionTopConstraint = transcriptionStatusView.topAnchor.constraint(equalTo: recordingStatusView.bottomAnchor, constant: 8)
+        let tableTopWithStatusConstraint = tableView.topAnchor.constraint(equalTo: transcriptionStatusView.bottomAnchor, constant: 8)
+        
+        // Initially deactivate status constraints
+        recordingTopConstraint.isActive = false
+        transcriptionTopConstraint.isActive = false
+        tableTopWithStatusConstraint.isActive = false
+        
+        NSLayoutConstraint.activate([
+            // Recording status view
+            recordingStatusView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            recordingStatusView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            recordingStatusView.heightAnchor.constraint(equalToConstant: 80),
+            
+            // Transcription status view
+            transcriptionStatusView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            transcriptionStatusView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            transcriptionStatusView.heightAnchor.constraint(equalToConstant: 50),
+            
+            // Table view - fills available space
+            tableTopConstraint,
+            tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            tableView.bottomAnchor.constraint(equalTo: recordButton.topAnchor, constant: -20),
+            
+            // Empty state
+            emptyStateView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            emptyStateView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            emptyStateView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            emptyStateView.bottomAnchor.constraint(equalTo: recordButton.topAnchor, constant: -20),
+            
+            // Record button - Apple-style positioning
+            recordButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            recordButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
+            recordButton.widthAnchor.constraint(equalToConstant: 70),
+            recordButton.heightAnchor.constraint(equalToConstant: 70)
+        ])
+        
+        // Store constraints for dynamic updates
+        self.recordingTopConstraint = recordingTopConstraint
+        self.transcriptionTopConstraint = transcriptionTopConstraint
+        self.tableTopConstraint = tableTopConstraint
+        self.tableTopWithStatusConstraint = tableTopWithStatusConstraint
+    }
+    
+    // Constraint references for dynamic layout
+    private var recordingTopConstraint: NSLayoutConstraint!
+    private var transcriptionTopConstraint: NSLayoutConstraint!
+    private var tableTopConstraint: NSLayoutConstraint!
+    private var tableTopWithStatusConstraint: NSLayoutConstraint!
+    
+    private func setupBindings() {
+        // Data manager bindings
+        dataManager.$sessions
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] sessions in
+                self?.updateSessions(sessions)
+            }
+            .store(in: &cancellables)
+        
+        dataManager.$isLoading
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isLoading in
+                if !isLoading {
+                    self?.tableView.refreshControl?.endRefreshing()
+                }
+            }
+            .store(in: &cancellables)
+        
+        audioManager.$isRecording
+            .receive(on: DispatchQueue.main)
+            .removeDuplicates()
+            .sink { [weak self] isRecording in
+                self?.updateRecordingState(isRecording)
+                
+                if !isRecording {
+                    print("🚀 Recording stopped - triggering multiple refresh waves")
+                    Task {
+                        await self?.dataManager.loadSessions()
+                        
+                        // ⚡ MULTIPLE REFRESH WAVES: Catch transcription updates
+                        try? await Task.sleep(for: .seconds(1))
+                        await self?.dataManager.loadSessions()
+                        
+                        try? await Task.sleep(for: .seconds(3))
+                        await self?.dataManager.loadSessions()
+                        
+                        try? await Task.sleep(for: .seconds(5))
+                        await self?.dataManager.loadSessions()
+                    }
+                }
+            }
+            .store(in: &cancellables)
+        
+        audioManager.$recordingDuration
+            .receive(on: DispatchQueue.main)
+            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)
+            .sink { [weak self] duration in
+                self?.recordingStatusView.updateDuration(duration)
+            }
+            .store(in: &cancellables)
+        
+        audioManager.$audioLevel
+            .receive(on: DispatchQueue.main)
+            .throttle(for: .milliseconds(50), scheduler: DispatchQueue.main, latest: true)
+            .sink { [weak self] level in
+                self?.recordingStatusView.updateAudioLevel(level)
+            }
+            .store(in: &cancellables)
+        
+        audioManager.$errorMessage
+            .receive(on: DispatchQueue.main)
+            .compactMap { $0 }
+            .sink { [weak self] error in
+                self?.showErrorAlert(message: error)
+            }
+            .store(in: &cancellables)
+        
+        // ⚡ ENHANCED: More aggressive transcription service bindings
+        transcriptionService.$isProcessing
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isProcessing in
+                let shouldShow = isProcessing
+                self?.transcriptionStatusView.isHidden = !shouldShow
+                self?.updateConstraintsForStatusVisibility()
+                
+                if shouldShow {
+                    self?.transcriptionStatusView.updateStatus(isProcessing: true, pendingCount: 0)
+                }
+                
+                // ⚡ FORCE: Always refresh UI when transcription starts/stops
+                Task {
+                    await self?.dataManager.loadSessions()
+                }
+            }
+            .store(in: &cancellables)
+        
+        transcriptionService.$pendingTranscriptions
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] pendingCount in
+                if pendingCount > 0 {
+                    self?.transcriptionStatusView.isHidden = false
+                    self?.transcriptionStatusView.updateStatus(isProcessing: false, pendingCount: pendingCount)
+                    self?.updateConstraintsForStatusVisibility()
+                }
+                
+                // ⚡ FORCE: Always refresh UI when pending count changes
+                Task {
+                    await self?.dataManager.loadSessions()
+                }
+            }
+            .store(in: &cancellables)
+        
+        transcriptionService.$completedTranscriptions
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] completedCount in
+                print("🎯 Transcription completed count: \(completedCount)")
+                
+                // ⚡ IMMEDIATE: Force UI refresh when transcription completes
+                Task {
+                    await self?.dataManager.loadSessions()
+                    
+                    // ⚡ FOLLOW-UP: Additional refresh to ensure UI is updated
+                    try? await Task.sleep(for: .milliseconds(500))
+                    await self?.dataManager.loadSessions()
+                }
+            }
+            .store(in: &cancellables)
+    }
+    
+    private func setupModelContexts() {
+        audioManager.modelContext = modelContext
+        transcriptionService.modelContext = modelContext
+        dataManager.configure(with: modelContext!)
+    }
+    
+    private func setupNotificationListeners() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(transcriptionCompleted),
+            name: Notification.Name("TranscriptionCompleted"),
+            object: nil
+        )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appBecameActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+    }
+    
+    // MARK: - Data Management (ENHANCED)
+    private func updateSessions(_ sessions: [RecordingSession]) {
+        let wasEmpty = filteredSessions.isEmpty
+        
+        if searchController.isActive, let searchText = searchController.searchBar.text, !searchText.isEmpty {
+            filteredSessions = filterSessions(sessions, with: searchText)
+        } else {
+            filteredSessions = sessions
+        }
+        
+        let isEmpty = filteredSessions.isEmpty
+        
+        // ⚡ ALWAYS UPDATE UI: Force refresh to ensure transcription updates show
+        print("🔄 Updating sessions UI - \(filteredSessions.count) sessions")
+        tableView.reloadData()
+        
+        // Smooth transitions for empty state
+        if wasEmpty != isEmpty {
+            UIView.transition(with: view, duration: 0.3, options: .transitionCrossDissolve) {
+                self.emptyStateView.isHidden = !isEmpty
+                self.tableView.isHidden = isEmpty
+            }
+        } else {
+            emptyStateView.isHidden = !isEmpty
+            tableView.isHidden = isEmpty
+        }
+    }
+    
+    private func filterSessions(_ sessions: [RecordingSession], with searchText: String) -> [RecordingSession] {
+        return sessions.filter { session in
+            if session.title.localizedCaseInsensitiveContains(searchText) {
+                return true
+            }
+            
+            return session.segments.contains { segment in
+                segment.transcription?.text.localizedCaseInsensitiveContains(searchText) ?? false
+            }
+        }
+    }
+    
+    // MARK: - UI Updates with Dynamic Layout
+    private func updateRecordingState(_ isRecording: Bool) {
+        recordButton.isSelected = isRecording
+        
+        UIView.animate(withDuration: 0.4, delay: 0, usingSpringWithDamping: 0.8, initialSpringVelocity: 0) {
+            self.recordButton.backgroundColor = isRecording ? .systemGray : .systemRed
+            self.recordingStatusView.isHidden = !isRecording
+            self.updateConstraintsForStatusVisibility()
+        }
+        
+        if !isRecording {
+            Task {
+                try? await Task.sleep(for: .milliseconds(500))
+                await dataManager.loadSessions()
+            }
+        }
+    }
+    
+    private func updateTranscriptionStatus(isProcessing: Bool, pendingCount: Int) {
+        let shouldShow = isProcessing || pendingCount > 0
+        
+        if shouldShow {
+            transcriptionStatusView.updateStatus(
+                isProcessing: isProcessing,
+                pendingCount: pendingCount
+            )
+        }
+        
+        UIView.animate(withDuration: 0.3, delay: 0, usingSpringWithDamping: 0.8, initialSpringVelocity: 0) {
+            self.transcriptionStatusView.isHidden = !shouldShow
+            self.updateConstraintsForStatusVisibility()
+        }
+    }
+    
+    private func updateConstraintsForStatusVisibility() {
+        let hasRecording = !recordingStatusView.isHidden
+        let hasTranscription = !transcriptionStatusView.isHidden
+        
+        // Deactivate all dynamic constraints
+        recordingTopConstraint.isActive = false
+        transcriptionTopConstraint.isActive = false
+        tableTopConstraint.isActive = false
+        tableTopWithStatusConstraint.isActive = false
+        
+        if hasRecording || hasTranscription {
+            if hasRecording {
+                recordingTopConstraint.isActive = true
+            }
+            if hasTranscription {
+                transcriptionTopConstraint.isActive = true
+            }
+            tableTopWithStatusConstraint.isActive = true
+        } else {
+            tableTopConstraint.isActive = true
+        }
+        
+        view.layoutIfNeeded()
+    }
+    
+    // MARK: - Intelligent Refresh System (RESTORED)
+    private func startIntelligentRefresh() {
+        autoRefreshTask = Task { [weak self] in
+            var refreshInterval: TimeInterval = 1.0 // Start with 1 second
+            
+            func scheduleNextRefresh() {
+                guard let self = self else { return }
+                
+                Task {
+                    try? await Task.sleep(for: .seconds(refreshInterval))
+                    
+                    guard !Task.isCancelled else { return }
+                    
+                    let hasProcessingSessions = await self.dataManager.sessions.contains { session in
+                        session.totalSegments > 0 && session.transcribedSegments < session.totalSegments
+                    }
+                    
+                    if hasProcessingSessions {
+                        print("🔄 Auto-refresh (interval: \(refreshInterval)s)")
+                        await self.dataManager.loadSessions()
+                        
+                        // ⚡ EXPONENTIAL BACKOFF: Increase interval but cap at 5 seconds
+                        refreshInterval = min(5.0, refreshInterval * 1.2)
+                        scheduleNextRefresh()
+                    } else {
+                        print("⏹️ All transcriptions complete - stopping auto-refresh")
+                        refreshInterval = 1.0 // Reset for next time
+                    }
+                }
+            }
+            
+            scheduleNextRefresh()
+        }
+    }
+    
+    //  Instant UI update when transcription completes
+    @objc private func transcriptionCompleted(notification: Notification) {
+        print("🎯 Received transcription completion notification")
+        
+        if let userInfo = notification.userInfo,
+           let segmentId = userInfo["segmentId"] as? UUID,
+           let sessionId = userInfo["sessionId"] as? UUID {
+            print("📊 Transcription completed for segment \(segmentId) in session \(sessionId)")
+        }
+        
+    // IMMEDIATE: Force UI refresh
+        Task {
+            print("🚀 Forcing immediate UI refresh for transcription completion")
+            await dataManager.loadSessions()
+            
+            // ⚡ FOLLOW-UP: Additional refresh to ensure persistence
+            try? await Task.sleep(for: .milliseconds(500))
+            await dataManager.loadSessions()
+        }
+    }
+    
+    @objc private func appBecameActive() {
+        print("📱 App became active - refreshing UI")
+        Task {
+            await dataManager.loadSessions()
+        }
+    }
+    
+    @objc public func triggerImmediateRefresh() {
+        print("🚀 Triggered immediate refresh")
+        debugTranscriptionStatus()
+        Task {
+            await dataManager.loadSessions()
+        }
+    }
+    
+    //  DEBUGGING: Add method to check current transcription status
+    private func debugTranscriptionStatus() {
+        print("🔍 DEBUG: Current sessions status:")
+        for (index, session) in dataManager.sessions.enumerated() {
+            print("  Session \(index): \(session.title)")
+            print("    Total segments: \(session.totalSegments)")
+            print("    Transcribed: \(session.transcribedSegments)")
+            print("    Progress: \(Int(session.transcriptionProgress * 100))%")
+            print("    Completed: \(session.isCompleted)")
+            
+            for segment in session.segments {
+                let hasTranscription = segment.transcription != nil
+                print("    Segment \(segment.segmentIndex): \(segment.transcriptionStatus) (has transcription: \(hasTranscription))")
+            }
+        }
+    }
+    
+    private func cancelRefreshOperations() {
+        refreshWorkItem?.cancel()
+        autoRefreshTask?.cancel()
+        autoRefreshTask = nil
+    }
+    
+    // MARK: - Actions (ENHANCED)
+    @objc private func handleRefresh() {
         print("🔄 Manual refresh triggered")
         
-        // ⚡ VISUAL: Show refresh control immediately
+        //  VISUAL: Show refresh control immediately
         if let refreshControl = tableView.refreshControl {
             refreshControl.beginRefreshing()
         }
         
-        loadSessions()
-        
-        // ⚡ FOLLOW-UP: Ensure refresh control stops
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            self.tableView.refreshControl?.endRefreshing()
+        Task {
+            await dataManager.loadSessions()
+            
+            // ⚡ FOLLOW-UP: Ensure refresh control stops
+            try? await Task.sleep(for: .seconds(1))
+            await MainActor.run {
+                self.tableView.refreshControl?.endRefreshing()
+            }
         }
     }
     
-    // MARK: - Actions
+
     @objc private func recordButtonTapped() {
         if audioManager.isRecording {
-            print("⏹️ Stopping recording")
             audioManager.stopRecording()
         } else {
-            print("🎤 Starting recording process")
             requestMicrophonePermission { [weak self] granted in
                 if granted {
                     self?.startNewRecording()
@@ -604,7 +716,7 @@ class RecordingSessionsViewController: UIViewController {
     }
     
     @objc private func exportButtonTapped() {
-        guard !sessions.isEmpty else {
+        guard !dataManager.sessions.isEmpty else {
             showErrorAlert(message: "No recordings to export")
             return
         }
@@ -615,13 +727,8 @@ class RecordingSessionsViewController: UIViewController {
             self?.exportAllTranscriptions()
         })
         
-        alertController.addAction(UIAlertAction(title: "Export Selected Recording", style: .default) { [weak self] _ in
-            self?.showExportSelection()
-        })
-        
         alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         
-        // For iPad
         if let popover = alertController.popoverPresentationController {
             popover.barButtonItem = navigationItem.leftBarButtonItem
         }
@@ -629,6 +736,7 @@ class RecordingSessionsViewController: UIViewController {
         present(alertController, animated: true)
     }
     
+    // MARK: - Helper Methods
     private func startNewRecording() {
         let alertController = UIAlertController(title: "New Recording", message: "Enter a title for this recording", preferredStyle: .alert)
         
@@ -642,24 +750,15 @@ class RecordingSessionsViewController: UIViewController {
         
         let startAction = UIAlertAction(title: "Start", style: .default) { [weak self] _ in
             let title = alertController.textFields?.first?.text ?? "Untitled Recording"
-            print("🎤 Starting recording: \(title)")
-            
-            // Clear any previous errors
-            self?.audioManager.errorMessage = nil
-            
-            // Start recording
             self?.audioManager.startRecording(title: title)
         }
         
-        let cancelAction = UIAlertAction(title: "Cancel", style: .cancel)
-        
         alertController.addAction(startAction)
-        alertController.addAction(cancelAction)
+        alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         
         present(alertController, animated: true)
     }
     
-    // MARK: - Export Functions
     private func exportAllTranscriptions() {
         var allText = "iAudio - Complete Transcription Export\n"
         
@@ -668,9 +767,9 @@ class RecordingSessionsViewController: UIViewController {
         dateFormatter.timeStyle = .medium
         
         allText += "Generated: \(dateFormatter.string(from: Date()))\n"
-        allText += "Total Recordings: \(sessions.count)\n\n"
+        allText += "Total Recordings: \(dataManager.sessions.count)\n\n"
         
-        for session in sessions.sorted(by: { $0.createdDate < $1.createdDate }) {
+        for session in dataManager.sessions.sorted(by: { $0.createdDate < $1.createdDate }) {
             allText += "═══════════════════════════════════════\n"
             allText += "📝 \(session.title)\n"
             allText += "📅 \(dateFormatter.string(from: session.createdDate))\n"
@@ -702,33 +801,21 @@ class RecordingSessionsViewController: UIViewController {
         present(activityVC, animated: true)
     }
     
-    private func showExportSelection() {
-        let alert = UIAlertController(title: "Export Selection", message: "This feature allows selecting specific recordings for export", preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "Coming Soon", style: .default))
-        present(alert, animated: true)
-    }
-    
-    // MARK: - Helper Methods
     private func requestMicrophonePermission(completion: @escaping (Bool) -> Void) {
         let audioSession = AVAudioSession.sharedInstance()
         
         switch audioSession.recordPermission {
         case .granted:
-            print("🎤 Microphone permission already granted")
             completion(true)
         case .denied:
-            print("🚫 Microphone permission denied")
             completion(false)
         case .undetermined:
-            print("❓ Requesting microphone permission")
             audioSession.requestRecordPermission { granted in
                 DispatchQueue.main.async {
-                    print(granted ? "✅ Microphone permission granted" : "❌ Microphone permission denied")
                     completion(granted)
                 }
             }
         @unknown default:
-            print("❓ Unknown microphone permission status")
             completion(false)
         }
     }
@@ -736,7 +823,7 @@ class RecordingSessionsViewController: UIViewController {
     private func showPermissionDeniedAlert() {
         let alert = UIAlertController(
             title: "Microphone Permission Required",
-            message: "Please enable microphone access in Settings to record audio. This app needs microphone access to record and transcribe audio.",
+            message: "Please enable microphone access in Settings to record audio.",
             preferredStyle: .alert
         )
         
@@ -747,7 +834,6 @@ class RecordingSessionsViewController: UIViewController {
         })
         
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        
         present(alert, animated: true)
     }
     
@@ -772,7 +858,7 @@ extension RecordingSessionsViewController: UITableViewDataSource, UITableViewDel
     }
     
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "SessionCell", for: indexPath) as! RecordingSessionTableViewCell
+        let cell = tableView.dequeueReusableCell(withIdentifier: "SessionCell", for: indexPath) as! AppleStyleSessionCell
         let session = filteredSessions[indexPath.row]
         cell.configure(with: session)
         return cell
@@ -780,6 +866,7 @@ extension RecordingSessionsViewController: UITableViewDataSource, UITableViewDel
     
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
+        
         let session = filteredSessions[indexPath.row]
         let detailVC = SessionDetailViewController(session: session)
         detailVC.modelContext = modelContext
@@ -789,7 +876,21 @@ extension RecordingSessionsViewController: UITableViewDataSource, UITableViewDel
     func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
         if editingStyle == .delete {
             let session = filteredSessions[indexPath.row]
-            deleteSession(session, at: indexPath)
+            
+            Task {
+                do {
+                    try await dataManager.deleteSession(session)
+                    
+                    if let index = filteredSessions.firstIndex(where: { $0.id == session.id }) {
+                        filteredSessions.remove(at: index)
+                        tableView.deleteRows(at: [IndexPath(row: index, section: 0)], with: .fade)
+                    }
+                } catch {
+                    await MainActor.run {
+                        showErrorAlert(message: "Failed to delete session: \(error.localizedDescription)")
+                    }
+                }
+            }
         }
     }
     
@@ -801,42 +902,19 @@ extension RecordingSessionsViewController: UITableViewDataSource, UITableViewDel
                 self?.shareSession(session)
             }
             
-            let export = UIAction(title: "Export Audio", image: UIImage(systemName: "arrow.down.doc")) { [weak self] _ in
-                self?.exportSessionAudio(session)
-            }
-            
             let delete = UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in
-                if let index = self?.filteredSessions.firstIndex(where: { $0.id == session.id }) {
-                    self?.deleteSession(session, at: IndexPath(row: index, section: 0))
+                Task {
+                    try? await self?.dataManager.deleteSession(session)
                 }
             }
             
-            return UIMenu(title: session.title, children: [share, export, delete])
+            return UIMenu(title: session.title, children: [share, delete])
         }
     }
     
     private func shareSession(_ session: RecordingSession) {
         let transcriptionText = generateTranscriptionText(for: session)
         let activityVC = UIActivityViewController(activityItems: [transcriptionText], applicationActivities: nil)
-        
-        if let popover = activityVC.popoverPresentationController {
-            popover.sourceView = view
-            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
-        }
-        
-        present(activityVC, animated: true)
-    }
-    
-    private func exportSessionAudio(_ session: RecordingSession) {
-        let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let audioURL = documentsDirectory.appendingPathComponent(session.audioFilePath)
-        
-        guard FileManager.default.fileExists(atPath: audioURL.path) else {
-            showErrorAlert(message: "Audio file not found")
-            return
-        }
-        
-        let activityVC = UIActivityViewController(activityItems: [audioURL], applicationActivities: nil)
         
         if let popover = activityVC.popoverPresentationController {
             popover.sourceView = view
@@ -871,55 +949,6 @@ extension RecordingSessionsViewController: UITableViewDataSource, UITableViewDel
         
         return text
     }
-    
-    private func deleteSession(_ session: RecordingSession, at indexPath: IndexPath) {
-        guard let context = modelContext else {
-            showErrorAlert(message: "Database context not available")
-            return
-        }
-        
-        print("🗑️ Deleting session: \(session.title)")
-        
-        // Delete audio files
-        let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        
-        do {
-            try FileManager.default.removeItem(at: documentsDirectory.appendingPathComponent(session.audioFilePath))
-            print("✅ Deleted main audio file")
-        } catch {
-            print("⚠️ Failed to delete main audio file: \(error)")
-        }
-        
-        for segment in session.segments {
-            do {
-                try FileManager.default.removeItem(at: documentsDirectory.appendingPathComponent(segment.audioFilePath))
-                print("✅ Deleted segment file")
-            } catch {
-                print("⚠️ Failed to delete segment file: \(error)")
-            }
-        }
-        
-        // Delete from model
-        context.delete(session)
-        
-        do {
-            try context.save()
-            print("✅ Session deleted from database")
-        } catch {
-            print("❌ Failed to save after deletion: \(error)")
-            showErrorAlert(message: "Failed to delete session: \(error.localizedDescription)")
-            return
-        }
-        
-        // Update UI
-        if let sessionIndex = sessions.firstIndex(where: { $0.id == session.id }) {
-            sessions.remove(at: sessionIndex)
-        }
-        filteredSessions.remove(at: indexPath.row)
-        
-        tableView.deleteRows(at: [indexPath], with: .fade)
-        updateEmptyState()
-    }
 }
 
 // MARK: - Search Results Updating
@@ -928,23 +957,408 @@ extension RecordingSessionsViewController: UISearchResultsUpdating {
     func updateSearchResults(for searchController: UISearchController) {
         guard let searchText = searchController.searchBar.text else { return }
         
-        if searchText.isEmpty {
-            filteredSessions = sessions
-        } else {
-            filteredSessions = sessions.filter { session in
-                // Search in title
-                if session.title.localizedCaseInsensitiveContains(searchText) {
-                    return true
-                }
-                
-                // Search in transcription text
-                return session.segments.contains { segment in
-                    segment.transcription?.text.localizedCaseInsensitiveContains(searchText) ?? false
-                }
+        refreshWorkItem?.cancel()
+        
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            
+            if searchText.isEmpty {
+                self.filteredSessions = self.dataManager.sessions
+            } else {
+                self.filteredSessions = self.filterSessions(self.dataManager.sessions, with: searchText)
+            }
+            
+            DispatchQueue.main.async {
+                self.tableView.reloadData()
+                self.emptyStateView.isHidden = !self.filteredSessions.isEmpty
+                self.tableView.isHidden = self.filteredSessions.isEmpty
             }
         }
         
-        tableView.reloadData()
-        updateEmptyState()
+        refreshWorkItem = workItem
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.3, execute: workItem)
+    }
+}
+
+// MARK: - Custom Status Views
+class RecordingStatusView: UIView {
+    
+    private lazy var stackView: UIStackView = {
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
+    }()
+    
+    private lazy var topRowStack: UIStackView = {
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.distribution = .equalSpacing
+        return stack
+    }()
+    
+    private lazy var recordingLabel: UILabel = {
+        let label = UILabel()
+        label.text = "● Recording..."
+        label.font = .systemFont(ofSize: 16, weight: .medium)
+        label.textColor = .systemRed
+        return label
+    }()
+    
+    private lazy var durationLabel: UILabel = {
+        let label = UILabel()
+        label.text = "00:00"
+        label.font = .monospacedDigitSystemFont(ofSize: 16, weight: .medium)
+        label.textColor = .label
+        return label
+    }()
+    
+    private lazy var audioLevelView: UIProgressView = {
+        let progress = UIProgressView(progressViewStyle: .default)
+        progress.progressTintColor = .systemGreen
+        progress.trackTintColor = .systemGray5
+        progress.layer.cornerRadius = 2
+        progress.clipsToBounds = true
+        return progress
+    }()
+    
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setupUI()
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    private func setupUI() {
+        backgroundColor = .systemBackground
+        layer.cornerRadius = 12
+        layer.borderWidth = 1
+        layer.borderColor = UIColor.systemRed.withAlphaComponent(0.3).cgColor
+        
+        addSubview(stackView)
+        
+        topRowStack.addArrangedSubview(recordingLabel)
+        topRowStack.addArrangedSubview(durationLabel)
+        
+        stackView.addArrangedSubview(topRowStack)
+        stackView.addArrangedSubview(audioLevelView)
+        
+        NSLayoutConstraint.activate([
+            stackView.topAnchor.constraint(equalTo: topAnchor, constant: 16),
+            stackView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            stackView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            stackView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
+            
+            audioLevelView.heightAnchor.constraint(equalToConstant: 4)
+        ])
+    }
+    
+    func updateDuration(_ duration: TimeInterval) {
+        let minutes = Int(duration) / 60
+        let seconds = Int(duration) % 60
+        durationLabel.text = String(format: "%02d:%02d", minutes, seconds)
+    }
+    
+    func updateAudioLevel(_ level: Float) {
+        audioLevelView.setProgress(level, animated: true)
+    }
+}
+
+class TranscriptionStatusView: UIView {
+    
+    private lazy var label: UILabel = {
+        let label = UILabel()
+        label.font = .systemFont(ofSize: 14, weight: .medium)
+        label.textColor = .systemBlue
+        label.textAlignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }()
+    
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setupUI()
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    private func setupUI() {
+        backgroundColor = .systemBlue.withAlphaComponent(0.1)
+        layer.cornerRadius = 12
+        layer.borderWidth = 1
+        layer.borderColor = UIColor.systemBlue.withAlphaComponent(0.3).cgColor
+        
+        addSubview(label)
+        
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
+        ])
+    }
+    
+    func updateStatus(isProcessing: Bool, pendingCount: Int) {
+        if pendingCount > 0 {
+            label.text = "⏳ \(pendingCount) transcriptions pending"
+        } else if isProcessing {
+            label.text = "⚡ Transcribing..."
+        }
+    }
+}
+
+// MARK: - Apple-Style Empty State View
+class AppleStyleEmptyStateView: UIView {
+    
+    private lazy var contentStackView: UIStackView = {
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 20
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
+    }()
+    
+    private lazy var microphoneImageView: UIImageView = {
+        let imageView = UIImageView()
+        let config = UIImage.SymbolConfiguration(pointSize: 64, weight: .medium)
+        imageView.image = UIImage(systemName: "mic.circle.fill", withConfiguration: config)
+        imageView.tintColor = .systemGray3
+        imageView.contentMode = .scaleAspectFit
+        return imageView
+    }()
+    
+    private lazy var titleLabel: UILabel = {
+        let label = UILabel()
+        label.text = "No Recordings Yet"
+        label.font = .systemFont(ofSize: 28, weight: .bold)
+        label.textColor = .label
+        label.textAlignment = .center
+        return label
+    }()
+    
+    private lazy var descriptionLabel: UILabel = {
+        let label = UILabel()
+        label.text = "Tap the record button to create your first audio recording. All recordings will be automatically transcribed and saved here."
+        label.font = .systemFont(ofSize: 17)
+        label.textColor = .secondaryLabel
+        label.textAlignment = .center
+        label.numberOfLines = 0
+        return label
+    }()
+    
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setupUI()
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    private func setupUI() {
+        addSubview(contentStackView)
+        
+        contentStackView.addArrangedSubview(microphoneImageView)
+        contentStackView.addArrangedSubview(titleLabel)
+        contentStackView.addArrangedSubview(descriptionLabel)
+        
+        NSLayoutConstraint.activate([
+            contentStackView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            contentStackView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            contentStackView.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 40),
+            contentStackView.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -40),
+            
+            microphoneImageView.widthAnchor.constraint(equalToConstant: 80),
+            microphoneImageView.heightAnchor.constraint(equalToConstant: 80)
+        ])
+    }
+}
+
+// MARK: - Enhanced Apple-Style Table View Cell with Real-time Progress
+class AppleStyleSessionCell: UITableViewCell {
+    
+    private lazy var titleLabel: UILabel = {
+        let label = UILabel()
+        label.font = .systemFont(ofSize: 17, weight: .semibold)
+        label.textColor = .label
+        label.numberOfLines = 1
+        return label
+    }()
+    
+    private lazy var metadataStackView: UIStackView = {
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = 12
+        stack.distribution = .fillProportionally
+        return stack
+    }()
+    
+    private lazy var dateLabel: UILabel = {
+        let label = UILabel()
+        label.font = .systemFont(ofSize: 15)
+        label.textColor = .secondaryLabel
+        return label
+    }()
+    
+    private lazy var durationLabel: UILabel = {
+        let label = UILabel()
+        label.font = .monospacedDigitSystemFont(ofSize: 15, weight: .medium)
+        label.textColor = .secondaryLabel
+        label.textAlignment = .right
+        return label
+    }()
+    
+    private lazy var statusStackView: UIStackView = {
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = 8
+        stack.alignment = .center
+        return stack
+    }()
+    
+    private lazy var statusLabel: UILabel = {
+        let label = UILabel()
+        label.font = .systemFont(ofSize: 13, weight: .medium)
+        label.textColor = .systemBlue
+        return label
+    }()
+    
+    //  Progress indicator for real-time transcription updates
+    private lazy var progressView: UIProgressView = {
+        let progress = UIProgressView(progressViewStyle: .default)
+        progress.progressTintColor = .systemBlue
+        progress.trackTintColor = .systemGray5
+        progress.layer.cornerRadius = 2
+        progress.clipsToBounds = true
+        progress.isHidden = true
+        return progress
+    }()
+    
+    private lazy var segmentCountLabel: UILabel = {
+        let label = UILabel()
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabel
+        label.isHidden = true
+        return label
+    }()
+    
+    private lazy var transcriptionPreviewLabel: UILabel = {
+        let label = UILabel()
+        label.font = .systemFont(ofSize: 15)
+        label.textColor = .secondaryLabel
+        label.numberOfLines = 2
+        return label
+    }()
+    
+    private lazy var mainStackView: UIStackView = {
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        return stack
+    }()
+    
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        setupUI()
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    private func setupUI() {
+        backgroundColor = .clear
+        selectionStyle = .default
+        
+        contentView.addSubview(mainStackView)
+        
+        metadataStackView.addArrangedSubview(dateLabel)
+        metadataStackView.addArrangedSubview(durationLabel)
+        
+        statusStackView.addArrangedSubview(statusLabel)
+        statusStackView.addArrangedSubview(segmentCountLabel)
+        
+        mainStackView.addArrangedSubview(titleLabel)
+        mainStackView.addArrangedSubview(metadataStackView)
+        mainStackView.addArrangedSubview(statusStackView)
+        mainStackView.addArrangedSubview(progressView)
+        mainStackView.addArrangedSubview(transcriptionPreviewLabel)
+        
+        NSLayoutConstraint.activate([
+            mainStackView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
+            mainStackView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            mainStackView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            mainStackView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12),
+            
+            progressView.heightAnchor.constraint(equalToConstant: 3)
+        ])
+    }
+    
+    func configure(with session: RecordingSession) {
+        titleLabel.text = session.title
+        
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateStyle = .medium
+        dateFormatter.timeStyle = .short
+        dateLabel.text = dateFormatter.string(from: session.createdDate)
+        
+        durationLabel.text = formatDuration(session.duration)
+        
+        // ⚡ ENHANCED: Real-time status with progress tracking
+        if session.totalSegments == 0 {
+            statusLabel.text = "Processing..."
+            statusLabel.textColor = .systemOrange
+            progressView.isHidden = true
+            segmentCountLabel.isHidden = true
+        } else if session.transcribedSegments < session.totalSegments {
+            statusLabel.text = "Transcribing"
+            statusLabel.textColor = .systemBlue
+            
+            // ⚡ SHOW PROGRESS: Real-time transcription progress
+            progressView.isHidden = false
+            progressView.progress = session.transcriptionProgress
+            
+            segmentCountLabel.isHidden = false
+            segmentCountLabel.text = "(\(session.transcribedSegments)/\(session.totalSegments))"
+            
+            print("📊 Cell showing progress: \(session.transcribedSegments)/\(session.totalSegments) = \(session.transcriptionProgress)")
+        } else {
+            statusLabel.text = "Complete"
+            statusLabel.textColor = .systemGreen
+            progressView.isHidden = true
+            segmentCountLabel.isHidden = true
+        }
+        
+        //  Transcription preview with real-time updates
+        let transcriptionText = session.segments
+            .sorted { $0.segmentIndex < $1.segmentIndex }
+            .compactMap { $0.transcription?.text }
+            .joined(separator: " ")
+        
+        if transcriptionText.isEmpty {
+            if session.totalSegments > 0 && session.transcribedSegments == 0 {
+                transcriptionPreviewLabel.text = "Transcription in progress..."
+                transcriptionPreviewLabel.textColor = .systemBlue
+            } else {
+                transcriptionPreviewLabel.text = "No transcription available"
+                transcriptionPreviewLabel.textColor = .tertiaryLabel
+            }
+        } else {
+            transcriptionPreviewLabel.text = transcriptionText
+            transcriptionPreviewLabel.textColor = .secondaryLabel
+        }
+    }
+    
+    private func formatDuration(_ duration: TimeInterval) -> String {
+        let minutes = Int(duration) / 60
+        let seconds = Int(duration) % 60
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 }
